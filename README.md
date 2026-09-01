@@ -79,17 +79,11 @@ A simplified score-driven model is implemented directly in R in order to illustr
 
 The conditional mean evolves according to:
 
-\[
-\mu_{t+1}
-=
-\alpha
-+
-\beta(\mu_t-\alpha)
-+
-\gamma u_t
-\]
+$$
+\mu_{t+1} = \alpha + \beta(\mu_t - \alpha) + \gamma u_t
+$$
 
-where \(u_t\) is the score of the conditional log-likelihood.
+where $u_t$ is the score of the conditional log-likelihood.
 
 The model treats the scale parameter as constant and dynamically updates only the conditional mean.
 
@@ -99,9 +93,9 @@ Two score specifications are considered.
 
 Under the Gaussian specification, the score with respect to the conditional mean is proportional to the prediction error:
 
-\[
+$$
 u_t = y_t - \mu_t
-\]
+$$
 
 The Gaussian score is unbounded, meaning that extreme observations can have a large influence on the next parameter update.
 
@@ -109,13 +103,11 @@ The Gaussian score is unbounded, meaning that extreme observations can have a la
 
 Under the Student-t specification, the score is:
 
-\[
-u_t =
-\frac{(\nu+1)(y_t-\mu_t)}
-{\nu\sigma^2+(y_t-\mu_t)^2}
-\]
+$$
+u_t = \frac{(\nu+1)(y_t-\mu_t)}{\nu\sigma^2+(y_t-\mu_t)^2}
+$$
 
-where \(\nu\) represents the degrees of freedom.
+where $\nu$ represents the degrees of freedom.
 
 Unlike the Gaussian score, the Student-t score limits the influence of very large prediction errors.
 
@@ -131,24 +123,18 @@ The analysis is then extended using the R package `GAS`.
 
 The general GAS recursion is:
 
-\[
-\theta_{t+1}
-=
-\omega
-+
-A s_t
-+
-B\theta_t
-\]
+$$
+\theta_{t+1} = \omega + A s_t + B \theta_t
+$$
 
-where \(s_t\) is a scaled score of the conditional log-likelihood.
+where $s_t$ is a scaled score of the conditional log-likelihood.
 
 Identity score scaling is used in this project.
 
 Unlike the simplified implementation, the full GAS specification allows both:
 
-- conditional location \(\mu_t\);
-- conditional scale \(\sigma_t\);
+- conditional location $\mu_t$;
+- conditional scale $\sigma_t$;
 
 to evolve dynamically over time.
 
@@ -180,9 +166,9 @@ The manual Gaussian and Student-t score-driven models produce almost identical p
 
 In the Student-t specification, the estimated degrees of freedom are approximately:
 
-\[
+$$
 \hat{\nu} \approx 185
-\]
+$$
 
 A Student-t distribution with such a large number of degrees of freedom is effectively indistinguishable from a Gaussian distribution.
 
@@ -225,9 +211,9 @@ The Student-t model therefore provides a very large improvement in likelihood an
 
 The estimated degrees of freedom are:
 
-\[
+$$
 \hat{\nu} \approx 3.52
-\]
+$$
 
 which confirms strongly heavy-tailed behaviour.
 
@@ -242,9 +228,9 @@ The same conclusion emerges from the package-based GAS models.
 
 The estimated degrees of freedom are approximately:
 
-\[
+$$
 \hat{\nu} \approx 2.83
-\]
+$$
 
 confirming extremely heavy-tailed conditional behaviour.
 
@@ -269,9 +255,9 @@ For the non-Gaussian series, both full GAS specifications remove the main serial
 
 For the GAS-Student-t model, the Ljung-Box test on squared residuals produces a p-value of approximately:
 
-\[
+$$
 p \approx 0.97
-\]
+$$
 
 indicating no evidence of remaining autocorrelation in the conditional variance.
 
@@ -451,8 +437,3 @@ This repository contains an academic statistical modelling project.
 The fMRI data are used to study statistical time-series modelling techniques and the robustness properties of Generalized Autoregressive Score models.
 
 The results should not be interpreted as medical, neurological, psychiatric or clinical conclusions.
-
-The dataset is organised as a four-dimensional array:
-
-```text
-70 ROIs × 404 time points × 24 subjects × 2 sessions
