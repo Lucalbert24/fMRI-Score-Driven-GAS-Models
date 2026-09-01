@@ -1,0 +1,1061 @@
+---
+output:
+  pdf_document:
+    toc: false
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    fig_width: 7
+    fig_height: 4.2
+    latex_engine: xelatex
+
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \floatplacement{figure}{H}
+  - \usepackage{amsmath}
+  - \usepackage{amssymb}
+  - \usepackage{titling}
+  - \usepackage{titling}
+
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+\begin{titlepage}
+\centering
+\vspace*{2cm}
+
+{\LARGE\bfseries Score-Driven Models for fMRI BOLD Time Series}
+
+\vspace{0.5cm}
+
+{\large Advanced Time Series --- Coursework Assignment}
+
+\vspace{1.5cm}
+
+{\large\bfseries Group Members}
+
+\vspace{0.5cm}
+
+\begin{tabular}{ll}
+\textbf{Name} & \textbf{Student ID} \\
+\hline
+Abdelsamie Youssef  & 1223744 \\
+Alberti Luca        & 1236389 \\
+Canton Matteo       & 1236962 \\
+Toro Gabriele       & 1233629 \\
+\end{tabular}
+
+\vspace{1.5cm}
+
+{\large\bfseries Assignment Description}
+
+\vspace{0.5cm}
+
+\begin{minipage}{0.85\textwidth}
+\normalsize
+Choose two time series from the fMRI dataset discussed in class. Select one Gaussian
+and one non-Gaussian series (testable via normality diagnostics). Fit an appropriate
+score-driven model and compare it with a Gaussian model. Discuss the outputs of the
+analysis.
+\end{minipage}
+
+\vspace{1.5cm}
+
+{\large University of Bologna}
+
+{\large `r format(Sys.Date(), '%B %d, %Y')`}
+
+\vfill
+
+\newpage
+
+\end{titlepage}
+
+\clearpage
+\pagenumbering{roman}
+\setcounter{page}{1}
+
+\tableofcontents
+
+\clearpage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  out.width = "90%"
+)
+
+library(tseries)
+library(stats)
+library(numDeriv)
+library(e1071)
+library(GAS)
+library(FinTS)
+
+load("/Users/lucaalberti/Downloads/fMRI-ROI-time-series.RData")
+# ── Series selection ──────────────────────────────────────────────────────────
+find_series <- function(y) {
+  val <- matrix(NA, nrow = 70, ncol = 5)
+  for (i in 1:70) {
+    val_intern <- rep(NA, 24)
+    for (j in 1:24) {
+      ts_ij <- y[i, , j, 1]
+      ts_ij <- ts_ij[!is.na(ts_ij)]
+      if (length(ts_ij) >= 3 && sd(ts_ij) > 0)
+        val_intern[j] <- shapiro.test(ts_ij)$p.value
+    }
+    val[i, 1] <- max(val_intern, na.rm = TRUE) - min(val_intern, na.rm = TRUE)
+    val[i, 2] <- max(val_intern, na.rm = TRUE)   # max p-value (most Gaussian subject)
+    val[i, 3] <- min(val_intern, na.rm = TRUE)   # min p-value (least Gaussian subject)
+    val[i, 4] <- which.max(val_intern)            # index of most Gaussian subject
+    val[i, 5] <- which.min(val_intern)            # index of least Gaussian subject
+  }
+  return(val)
+}
+
+ts_mat          <- find_series(Y)
+gaussian.data    <- Y[69, , 18, 1]
+nongaussian.data <- Y[69, , 19, 1]
+
+# ── Manual GAS implementation ─────────────────────────────────────────────────
+
+# Normal log-likelihood: log p(y | mean = m, variance = s2)
+ll_n <- function(y, m, s2) dnorm(y, mean = m, sd = sqrt(s2), log = TRUE)
+
+# Student-t log-likelihood using the analytical density for numerical stability
+ll_t <- function(y, m, s2, nu) {
+  z2 <- (y - m)^2 / s2
+  lgamma((nu + 1) / 2) - lgamma(nu / 2) -
+    0.5 * log(pi * nu * s2) -
+    ((nu + 1) / 2) * log(1 + z2 / nu)
+}
+
+# Score-driven filter for the conditional mean mu_t:
+#   mu_{t+1} = a + b*(mu_t - a) + c*u_t
+# rb = FALSE: Gaussian score (unbounded, proportional to forecast error)
+# rb = TRUE : Student-t score (bounded, robust to outliers)
+fl_m <- function(y, th, rb = FALSE) {
+  n  <- length(y)
+  a  <- th[1]; b <- th[2]; c <- th[3]; s2 <- th[4]
+  if (rb) nu <- th[5]
+  m  <- rep(NA, n + 1); v <- rep(NA, n)
+  u  <- rep(NA, n);     ll <- rep(NA, n)
+  m[1] <- a
+  for (i in 1:n) {
+    v[i] <- y[i] - m[i]
+    if (rb) {
+      u[i]  <- v[i] / (1 + v[i]^2 / (nu * s2))  # bounded robust score
+      ll[i] <- ll_t(y[i], m[i], s2, nu)
+    } else {
+      u[i]  <- v[i]                               # unbounded Gaussian score
+      ll[i] <- ll_n(y[i], m[i], s2)
+    }
+    m[i + 1] <- a + b * (m[i] - a) + c * u[i]
+  }
+  list(m = m, v = v, u = u, ll = ll, lL = sum(ll))
+}
+
+# Objective function (negative log-likelihood) for nlminb.
+# Returns 1e10 if parameters violate stationarity, positivity, or nu range.
+obj_m <- function(th, y, rb = FALSE) {
+  a <- th[1]; b <- th[2]; c <- th[3]; s2 <- th[4]
+  if (!is.finite(a) || abs(b) >= 0.999 || !is.finite(c) || s2 <= 0) return(1e10)
+  if (rb) { nu <- th[5]; if (nu <= 2.099 || nu > 300) return(1e10) }
+  ft <- tryCatch(fl_m(y, th, rb = rb), error = function(e) NULL)
+  if (is.null(ft) || !is.finite(ft$lL)) return(1e10)
+  -ft$lL
+}
+
+lo_n <- c(-Inf, -0.995, -2, 1e-06);       up_n <- c(Inf, 0.995, 2, Inf)
+lo_t <- c(-Inf, -0.995, -2, 1e-06, 2.099); up_t <- c(Inf, 0.995, 2, Inf, 300)
+
+# ── Gaussian series — manual fit ───────────────────────────────────────────────
+yn <- as.numeric(na.omit(gaussian.data))
+
+est_n_nr <- nlminb(c(a = mean(yn), b = 0.75, c = 0.15, s2 = var(yn)),
+                   obj_m, y = yn, rb = FALSE, lower = lo_n, upper = up_n)
+th_n_nr  <- setNames(est_n_nr$par, c("a", "b", "c", "s2"))
+ft_n_nr  <- fl_m(yn, th_n_nr, rb = FALSE)
+e_n_nr   <- ft_n_nr$v / sqrt(th_n_nr["s2"])
+
+est_n_rb <- nlminb(c(a = mean(yn), b = 0.75, c = 0.15, s2 = var(yn), nu = 8),
+                   obj_m, y = yn, rb = TRUE, lower = lo_t, upper = up_t)
+th_n_rb  <- setNames(est_n_rb$par, c("a", "b", "c", "s2", "nu"))
+ft_n_rb  <- fl_m(yn, th_n_rb, rb = TRUE)
+e_n_rb   <- ft_n_rb$v / sqrt(th_n_rb["s2"])
+
+# ── Non-Gaussian series — manual fit ──────────────────────────────────────────
+ynn <- as.numeric(na.omit(nongaussian.data))
+
+est_nn_nr <- nlminb(c(a = mean(ynn), b = 0.75, c = 0.15, s2 = var(ynn)),
+                    obj_m, y = ynn, rb = FALSE, lower = lo_n, upper = up_n)
+th_nn_nr  <- setNames(est_nn_nr$par, c("a", "b", "c", "s2"))
+ft_nn_nr  <- fl_m(ynn, th_nn_nr, rb = FALSE)
+e_nn_nr   <- ft_nn_nr$v / sqrt(th_nn_nr["s2"])
+
+est_nn_rb <- nlminb(c(a = mean(ynn), b = 0.75, c = 0.15, s2 = var(ynn), nu = 8),
+                    obj_m, y = ynn, rb = TRUE, lower = lo_t, upper = up_t)
+th_nn_rb  <- setNames(est_nn_rb$par, c("a", "b", "c", "s2", "nu"))
+ft_nn_rb  <- fl_m(ynn, th_nn_rb, rb = TRUE)
+e_nn_rb   <- ft_nn_rb$v / sqrt(th_nn_rb["s2"])
+
+# ── GAS-Normal fits (package) ─────────────────────────────────────────────────
+spec_norm <- UniGASSpec(Dist = "norm", ScalingType = "Identity",
+                        GASPar = list(location = TRUE, scale = TRUE))
+fit1 <- UniGASFit(spec_norm, data = gaussian.data)
+fit2 <- UniGASFit(spec_norm, data = nongaussian.data)
+
+# ── GAS-Student-t, time-varying shape ─────────────────────────────────────────
+spec_std <- UniGASSpec(Dist = "std", ScalingType = "Identity",
+                          GASPar = list(location = TRUE, scale = TRUE, shape = FALSE))
+fit3 <- UniGASFit(spec_std, data = gaussian.data)
+fit4 <- UniGASFit(spec_std, data = nongaussian.data)
+
+# ── Filtered parameters ────────────────────────────────────────────────────────
+par1 <- getFilteredParameters(fit1)
+par2 <- getFilteredParameters(fit2)
+par3 <- getFilteredParameters(fit3)
+par4 <- getFilteredParameters(fit4)
+
+# ── Standardised residuals (package) ──────────────────────────────────────────
+res1 <- GAS::residuals(fit1, standardize = TRUE)
+res2 <- GAS::residuals(fit2, standardize = TRUE)
+res3 <- GAS::residuals(fit3, standardize = TRUE)
+res4 <- GAS::residuals(fit4, standardize = TRUE)
+
+# ── Log-likelihoods and information criteria ───────────────────────────────────
+n   <- length(nongaussian.data)
+n_g <- length(gaussian.data)
+
+l1 <- fit1@GASDyn$dLLK; k1 <- length(coef(fit1))
+l2 <- fit2@GASDyn$dLLK; k2 <- length(coef(fit2))
+l3 <- fit3@GASDyn$dLLK; k3 <- length(coef(fit3))
+l4 <- fit4@GASDyn$dLLK; k4 <- length(coef(fit4))
+
+# ── Likelihood Ratio Test: GAS-Normal vs GAS-Student-t (non-Gaussian series) ──
+# H0: nu → ∞ (Gaussian is correct); the Student-t model nests the Normal.
+# Degrees of freedom = difference in number of parameters = k4 - k2 = 1
+LRT_stat <- 2 * (l4 - l2)
+p_LRT    <- pchisq(LRT_stat, df = k4 - k2, lower.tail = FALSE)
+
+```
+
+\newpage
+\pagenumbering{arabic}
+\setcounter{page}{1}
+
+# Abstract {.unnumbered}
+
+This report presents an empirical application of Generalised Autoregressive Score (GAS)
+models to resting-state fMRI BOLD time series from the NKI-Rockland Sample dataset. Two
+series are selected from ROI 69: Subject 18, exhibiting approximate Gaussianity
+(Shapiro--Wilk $p = 0.9933$), and Subject 19, characterised by pronounced heavy tails and
+strong left skewness (excess kurtosis $\approx 52.5$, skewness $\approx -3.98$,
+$p < 3.86 \times 10^{-24}$).
+
+A manual score-driven mean model is first implemented under both Gaussian and Student-$t$
+score updates, isolating the core robustness mechanism of the GAS framework: the bounded
+Student-$t$ score limits the influence of extreme observations on the filtered mean, while
+the unbounded Gaussian score reacts proportionally to every shock. The analysis is then
+extended to the GAS package, which models location and scale jointly via the full score
+vector, allowing $\hat{\sigma}_t$ to evolve dynamically.
+
+For Subject 18, the GAS-Normal specification is both necessary and sufficient: the
+Student-$t$ variant yields $\hat{\nu} \approx 185$, effectively collapsing to the Gaussian
+score, with no meaningful improvement in AIC. For Subject 19, the GAS-Student-$t$
+specification dominates across all criteria: AIC drops from $1432.31$ to $1423.27$, BIC
+from $1456.32$ to $1451.28$, and $\hat{\nu} \approx 2.83$ confirms extremely heavy-tailed
+behaviour. The filtered scale $\hat{\sigma}_t$ under the GAS-Normal spikes to values
+exceeding $1500$ in response to a single extreme observation, while the Student-$t$
+specification maintains a substantially smoother volatility path. Residual diagnostics
+confirm the adequacy of the Student-$t$ specification: the Ljung--Box test on squared
+residuals passes comfortably ($p \approx 0.97$), indicating no remaining ARCH effects.
+
+------------------------------------------------------------------------
+
+# Introduction
+
+Nowadays, neuroscience is probably one of the clearest examples of a research field dealing with increasingly multidimensional and complex object-type data. Thanks to the combination of modern magnetic resonance imaging (MRI) technologies and advanced pre-processing algorithms, we can now reliably measure brain structure and function non-invasively in live humans.
+
+Among these technologies Functional Magnetic Resonance Imaging (fMRI) plays a key role. It opens up incredible avenues for studying activity and connectivity patterns within the brain, helping us understand how these dynamics change across individuals based on traits like behavior, age, and neuropsychiatric conditions.  The data analyzed in this report comes specifically from the NKI1 pilot study of the Enhanced Nathan Kline Institute-Rockland Sample project, a multimodal dataset underlying the complex brain system. 
+
+Our focus here is on dynamic functional activity monitored via resting-state fMRI (R-fMRI). Subjects are asked to stay awake with their eyes open without performing any explicit task. While they relax, the scanner monitors brain activity by capturing low-frequency fluctuations in the Blood-Oxygen-Level-Dependent (BOLD) signal across $V=70$ regions of interest.  
+
+The series lenght is $T=404$ and the differences in the measurements are caused by real-world complications like physiological noise. To solve these problems, this report applies the Generalized Autoregressive Score (GAS) model framework.
+
+Following the assignment guidelines, we selected two distinct region-specific time series from the fMRI dataset: one that respect standard normality assumptions and another that clearly rejects them. By fitting both a standard Gaussian GAS model and a non-Gaussian counterpart, we aim to find out exactly how much robustness we actually gain when we account for the heavy tails in the data.
+
+------------------------------------------------------------------------
+
+# Data Description
+
+## The fMRI Dataset
+### Dataset Structure
+
+The dataset analyzed in this report consists of resting-state fMRI recordings from a sample of 24 subjects. For each individual, the brain activity is mapped across 70 distinct regions of interest (ROIs). 
+
+The data is stored as a four-dimensional array $Y$ with dimension $[V \times T \times N \times K]$,where:
+
+* $V = 70$ represents the brain regions (ROIs).
+
+* $T = 404$ represents the equally spaced time points.
+
+* $N = 24$ represents the subjects.
+
+* $K = 2$ represents the scan-rescan sessions.
+
+All analyses and model estimations in this report are strictly based on the first scan session (Scan 1). Each extracted time series represents the BOLD signal intensity for a selected region, capturing the low-frequency fluctuations associated with spontaneous neural activity over a total of 404 observations.
+
+------------------------------------------------------------------------
+
+# Series Selection and Exploratory Analysis
+
+## Selection Strategy
+
+To identify a Gaussian and a non-Gaussian series, the Shapiro--Wilk normality test is applied systematically across all 24 subjects and 70 ROIs. For each ROI, the maximum and minimum Shapiro--Wilk $p$-values across subjects are recorded; the ROI with the largest difference between these extremes provides the most informative contrast. 
+
+This procedure identifies ROI 69 as the optimal candidate:
+
+-   Subject 18 yields a high Shapiro--Wilk $p$-value ($p =$
+    `r round(shapiro.test(gaussian.data)$p.value, 4)`), consistent with approximate Gaussianity.
+-   Subject 19 yields a near-zero $p$-value ($p <$
+    `r formatC(shapiro.test(nongaussian.data)$p.value, format = "e", digits = 2)`), indicating a highly significant departure from normality.
+
+Subject 18 (age 46) is a healthy control with no current or lifetime psychiatric diagnosis, consistent with a canonical Gaussian BOLD signal. Subject 19 (age 22) carries a lifetime history of Alcohol Abuse, Cannabis Dependence, and Depressive Disorder all of which can introduce atypical, heavy-tailed fluctuations in resting-state recordings.
+
+## Descriptive Statistics
+
+```{r desc-table}
+sw1 <- shapiro.test(gaussian.data)$p.value
+sw2 <- shapiro.test(nongaussian.data)$p.value
+jb1 <- tseries::jarque.bera.test(gaussian.data)$p.value
+jb2 <- tseries::jarque.bera.test(nongaussian.data)$p.value
+
+desc_df <- data.frame(
+  Statistic = c("Mean", "Std. Dev.", "Skewness", "Excess Kurtosis",
+                "Shapiro-Wilk p-value", "Jarque-Bera p-value"),
+  `Gaussian Series (Subject 18)` = c(
+    round(mean(gaussian.data),              4),
+    round(sd(gaussian.data),               4),
+    round(e1071::skewness(gaussian.data),  4),
+    round(e1071::kurtosis(gaussian.data),  4),
+    round(sw1, 4),
+    round(jb1, 4)
+  ),
+  `Non-Gaussian Series (Subject 19)` = c(
+    round(mean(nongaussian.data),              4),
+    round(sd(nongaussian.data),               4),
+    round(e1071::skewness(nongaussian.data),  4),
+    round(e1071::kurtosis(nongaussian.data),  4),
+    formatC(sw2, format = "e", digits = 2),
+    formatC(jb2, format = "e", digits = 2)
+  ),
+  check.names = FALSE
+)
+knitr::kable(desc_df,
+             caption = "Descriptive statistics and normality tests for the two selected series.",
+             booktabs = TRUE, align = "lcc")
+```
+
+Table 1 highlights the contrast between the two selected BOLD series. Subject 18 is approximately Gaussian: its mean is close to zero, the standard deviation is moderate, skewness and excess kurtosis are almost null, and both the Shapiro--Wilk and Jarque--Bera tests fail to reject normality. Subject 19 is clearly non-Gaussian. Compared with Subject 18, it has a much larger standard deviation, strong negative skewness, and extremely high excess kurtosis. Both normality tests reject the Gaussian assumption decisively, confirming the presence of heavy tails and asymmetry.
+Overall, Subject 18 provides a benchmark case for Gaussian score-driven modelling, while Subject 19 represents the heavy-tailed non-Gaussian case for which a robust Student-\(t\) GAS specification is expected to be more appropriate.
+
+## Time Series Plots
+```{r ts-plots, fig.cap="BOLD signal over time: Gaussian series, ROI 69 Subject 18 (top) and non-Gaussian series, ROI 69 Subject 19 (bottom). Note the isolated large negative spikes in the lower panel."}
+par(mfrow = c(2, 1), mar = c(3, 4, 2.5, 1))
+ts.plot(gaussian.data,
+        main = "Gaussian Series — Subject 18",
+        ylab = "BOLD signal", col = "blue", lwd = 1.6)
+ts.plot(nongaussian.data,
+        main = "Non-Gaussian Series — Subject 19",
+        ylab = "BOLD signal", col = "red", lwd = 1.6)
+par(mfrow = c(1, 1))
+```
+
+Subject 18 is characterized by a fluctuation between -3 and 3, without any spike. Differently the subject 19 shows a fluctuation on wider margins and the presence of spikes.
+
+
+## Normality Diagnostics
+```{r qqplots, fig.cap="Normal Q-Q plots: Gaussian series (left) and non-Gaussian series (right). Departures from the reference line in the tails indicate heavy-tailed, asymmetric behaviour."}
+par(mfrow = c(1, 2))
+qqnorm(gaussian.data,    main = "Q-Q — Gaussian",
+       col = "blue", pch = 16, cex = 0.8)
+qqline(gaussian.data,    col = "black", lwd = 2)
+qqnorm(nongaussian.data, main = "Q-Q — Non-Gaussian",
+       col = "red",  pch = 16, cex = 0.8)
+qqline(nongaussian.data, col = "black", lwd = 2)
+par(mfrow = c(1, 1))
+```
+The Q-Q plot of Subject 18 shows points lying close to the reference line throughout the range, consistent with normality. Subject 19 exhibits severe deviations in the lower tail, characteristic of a strongly leptokurtic, left-skewed distribution.
+
+## Autocorrelation Structure
+
+```{r acf-raw, fig.cap="ACF and PACF of the raw BOLD series. Dashed lines are 95\\% confidence bands under the white noise hypothesis.", fig.height=3.8, fig.width=6.5, out.width="100%"}
+par(mfrow = c(2, 2), mar = c(3, 4, 3.5, 1), oma = c(0, 0, 0, 0))
+acf(gaussian.data,     main = "ACF — Gaussian Series")
+pacf(gaussian.data,    main = "PACF — Gaussian Series")
+acf(nongaussian.data,  main = "ACF — Non-Gaussian Series")
+pacf(nongaussian.data, main = "PACF — Non-Gaussian Series")
+par(mfrow = c(1, 1))
+```
+
+Before fitting the score-driven models, we inspect the ACF and PACF to assess whether the selected BOLD series exhibit dependence in the conditional mean and variance. The presence of some significant spikes, especially at the first lags, suggests that the mean may not be purely constant and that a dynamic specification for $\mu_t$ is appropriate. The diagnosis of the variance dynamics is deferred 
+to the residuals of the estimated model. 
+
+
+------------------------------------------------------------------------
+
+# Manual Score-Driven Mean Model
+
+## Model Specification
+
+To deepen understanding of the robustness property of score-driven
+models, we implement a simplified GAS model from scratch that focuses exclusively on the conditional mean, treating the scale $\sigma^2$ as a constant nuisance parameter.
+
+The model is defined as:
+
+$$
+y_t = \mu_t + \varepsilon_t, \quad \varepsilon_t \sim F(0, \sigma^2)
+$$
+
+$$
+\mu_{t+1} = \alpha + \beta \,(\mu_t - \alpha) + \gamma \, u_t
+$$
+
+where $u_t$ is the GAS score update:
+
+$$
+u_t = \frac{\partial \log p(y_t \mid \mu_t, \sigma^2)}{\partial \mu_t}
+$$
+
+Under the Gaussian distribution, the score with respect to the mean is simply the prediction error:
+
+$$
+u_t^{\text{Normal}} ={y_t - \mu_t}
+$$
+The Gaussian score $u_t = (y_t - \mu_t)/\sigma^2$ is the raw score with identity scaling ($d=0$). The distinction with respect to $d=1$ is absorbed in the estimated parameter $\gamma$.
+
+Under the Student-$t$ distribution with $\nu$ degrees of freedom, the score is:
+
+$$
+u_t^{t} = \frac{(\nu+1)(y_t - \mu_t)}{\nu\,\sigma^2 + (y_t-\mu_t)^2}
+$$
+
+The key difference is that the Student-$t$ score is a bounded,
+Winsorised function of the prediction error: as $|y_t - \mu_t| \to \infty$, $u_t^t \to 0$,
+so extreme observations have limited influence on the next-step location update. This is the fundamental robustness property.
+
+The parameter vector $\theta = (\alpha, \beta, \gamma, \sigma^2)$ (and $\nu$ for the robust variant) is estimated by numerical maximisation of the log-likelihood using `nlminb` with box constraints.
+
+## Results — Gaussian Series (Subject 18)
+
+```{r manual-coef-gaussian}
+man_n_df <- data.frame(
+  Parameter = c("alpha (level)", "beta (persistence)",
+                "gamma (score coef.)", "sigma^2 (scale)",
+                "nu (degrees of freedom)"),
+  `Non-Robust (Gaussian score)` = c(round(th_n_nr, 4), NA),
+  `Robust (Student-t score)`    = round(th_n_rb, 4),
+  check.names = FALSE
+)
+knitr::kable(man_n_df,
+             caption = "Manual score-driven mean model: estimated parameters for the Gaussian series (Subject 18).",
+             booktabs = TRUE, align = "lcc", na = "—")
+```
+
+The parameter $\alpha$ denotes the long-run level around which the filtered mean $\mu_t$ fluctuates, while $\beta$ measures the persistence of the dynamic mean process. Since $\hat{\beta} \approx 0.89$, the filtered mean is highly persistent but still stationary. The coefficient $\gamma$ controls the reaction of the update to the score innovation $u_t$: larger values imply that new observations have a stronger effect on the next filtered mean. The parameter $\sigma^2$ is the estimated constant scale of the observation noise. In the Student-$t$ specification, $\nu$ controls tail thickness; the very large estimate $\hat{\nu} \approx 184.6$ indicates that the Student-$t$ score is almost indistinguishable from the Gaussian score. This explains why the robust and non-robust parameter estimates are nearly identical for Subject 18.
+
+
+```{r manual-ll-gaussian}
+man_ll_n <- data.frame(
+  Specification = c("Non-Robust (Gaussian score)", "Robust (Student-t score)"),
+  LogLik = round(c(ft_n_nr$lL, ft_n_rb$lL), 3),
+  k      = c(length(th_n_nr), length(th_n_rb)),
+  AIC    = round(c(-2 * ft_n_nr$lL + 2 * length(th_n_nr),
+                   -2 * ft_n_rb$lL + 2 * length(th_n_rb)), 3),
+  check.names = FALSE
+)
+knitr::kable(man_ll_n,
+             caption = "Log-likelihood and AIC for the manual model, Gaussian series.",
+             booktabs = TRUE, align = "lccc")
+```
+
+The robust Student-$t$ specification achieves almost the same log-likelihood as the Gaussian model, because the estimated degrees of freedom are very large and the Student-$t$ score effectively collapses to the Gaussian score. However, its AIC is slightly worse because it estimates one additional parameter, $\nu$, so the model adds complexity without providing a meaningful improvement in fit.
+
+```{r manual-filtered-gaussian, fig.cap="Manual model — Gaussian series (Subject 18). Left: data with filtered mean. Right: score update $u_t$"}
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+
+ts.plot(yn, main = "Data + Filtered mean",
+        ylab = "y", xlab = "Time")
+lines(ft_n_nr$m[-length(ft_n_nr$m)], col = "blue", lwd = 2)
+
+
+ts.plot(ft_n_nr$u, main = "Non-robust score update u_t",
+        ylab = "u", xlab = "Time", col = "blue")
+abline(h = 0, col = "black", lty = 2)
+
+
+```
+
+Figure 4 shows that, for the Gaussian series, the filtered mean remains smooth and fluctuates around the central level of the observed BOLD signal. The score update $u_t$ is centred around zero and does not display extreme spikes, suggesting that the Gaussian score is not excessively affected by outliers in this case. This is consistent with the previous parameter estimates: since the series is approximately Gaussian, the non-robust update already provides an adequate description of the conditional mean dynamics.
+
+\newpage
+
+## Results — Non-Gaussian Series (Subject 19)
+
+```{r manual-coef-nongaussian}
+man_nn_df <- data.frame(
+  Parameter = c("alpha (level)", "beta (persistence)",
+                "gamma (score coef.)", "sigma^2 (scale)",
+                "nu (degrees of freedom)"),
+  `Non-Robust (Gaussian score)` = c(round(th_nn_nr, 4), NA),
+  `Robust (Student-t score)`    = round(th_nn_rb, 4),
+  check.names = FALSE
+)
+knitr::kable(man_nn_df,
+             caption = "Manual score-driven mean model: estimated parameters for the non-Gaussian series (Subject 19).",
+             booktabs = TRUE, align = "lcc", na = "—")
+```
+
+The comparison in Table 4 shows clear differences between the two specifications for the non-Gaussian series. Under the robust Student-$t$ score, persistence increases from 0.6559 to 0.7673 and the score coefficient becomes much larger, indicating a stronger but more controlled update mechanism. At the same time, the estimated scale drops sharply from 4.9736 to 1.2030, suggesting that the Gaussian model inflates the variance to absorb extreme observations, while the Student-$t$ specification captures them through heavy tails, as confirmed by the low estimate $\hat{\nu} \approx 3.52$.
+
+
+```{r manual-ll-nongaussian}
+man_ll_nn <- data.frame(
+  Specification = c("Non-Robust (Gaussian score)", "Robust (Student-t score)"),
+  LogLik = round(c(ft_nn_nr$lL, ft_nn_rb$lL), 3),
+  k      = c(length(th_nn_nr), length(th_nn_rb)),
+  AIC    = round(c(-2 * ft_nn_nr$lL + 2 * length(th_nn_nr),
+                   -2 * ft_nn_rb$lL + 2 * length(th_nn_rb)), 3),
+  check.names = FALSE
+)
+knitr::kable(man_ll_nn,
+             caption = "Log-likelihood and AIC for the manual model, non-Gaussian series.",
+             booktabs = TRUE, align = "lccc")
+```
+
+For the non-Gaussian series, the contrast is striking. The robust
+Student-$t$ specification achieves a log-likelihood of
+`r round(ft_nn_rb$lL, 1)` compared to `r round(ft_nn_nr$lL, 1)` for the non-robust version a difference of more than 165 log-likelihood units. The estimated degrees of freedom
+($\hat{\nu} \approx$ `r round(th_nn_rb["nu"], 2)`) are small, confirming heavy-tailed behaviour. The AIC drops from
+`r round(-2*ft_nn_nr$lL + 2*length(th_nn_nr), 1)` to
+`r round(-2*ft_nn_rb$lL + 2*length(th_nn_rb), 1)`.
+
+```{r manual-filtered-nongaussian, fig.width=15,fig.height=3.5,fig.cap="Manual model, non-Gaussian series (Subject 19). Left: data with filtered mean. Right: score update $u_t$"}
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1),cex=0.9)
+
+
+ts.plot(ynn, main = "Data + Filtered mean",
+        ylab = "y", xlab = "Time")
+lines(ft_nn_rb$m[-length(ft_nn_rb$m)], col = "red", lwd = 2)
+
+
+ts.plot(ft_nn_rb$u, main = "Robust score update u_t",
+        ylab = "u", xlab = "Time", col = "red")
+abline(h = 0, col = "black", lty = 2)
+par(mfrow = c(1, 1))
+```
+
+The score update plots illustrate the robustness mechanism directly. For the robust model, the Student-$t$ score clamps extreme innovations, so the filtered mean path is significantly smoother. This phenomenon could be explained by the fact that the degrees of freedom of the robust model are 3.52, which means that the distribution is heavy-tailed. 
+
+\newpage
+
+## Ljung-Box Diagnostic Tests
+
+```{r ljungbox-table}
+lb_tests <- list(
+  `GAS-Normal, Subject 18 — residuals`      = Box.test(e_n_nr,    lag = 20, type = "Ljung-Box"),
+  `GAS-Normal, Subject 18 — residuals^2`    = Box.test(e_n_nr^2,  lag = 20, type = "Ljung-Box"),
+  `GAS-Student-t, Subject 19 — residuals`   = Box.test(e_nn_rb,   lag = 20, type = "Ljung-Box"),
+  `GAS-Student-t, Subject 19 — residuals^2` = Box.test(e_nn_rb^2, lag = 20, type = "Ljung-Box")
+)
+
+lb_df <- data.frame(
+  Series    = names(lb_tests),
+  `Q(20)`   = round(sapply(lb_tests, function(x) x$statistic), 3),
+  `p-value` = round(sapply(lb_tests, function(x) x$p.value),   4),
+  check.names = FALSE, row.names = NULL
+)
+knitr::kable(lb_df,
+             caption = "Ljung-Box test (20 lags) on residuals and squared residuals from the manual GAS mean model. H0: no serial correlation.",
+             booktabs = TRUE, align = "lcc")
+```
+
+The Ljung--Box diagnostics in Table 6 indicate that the selected manual specifications leave no significant serial correlation in the residuals. For the Gaussian series, both the residuals and squared residuals have large $p$-values, suggesting that the mean dynamics and the constant scale assumption are adequate for Subject 18.
+
+For the non-Gaussian series, the robust Student-$t$ specification also passes the Ljung--Box tests on both residuals and squared residuals. This suggests that the remaining residuals behave approximately as white noise and no relevant autocorrelation is left in either the conditional mean or variance.
+
+## Plot of the standardized residuals
+
+```{r residuals for gaussian series,fig.cap="Residuals for Gaussian series"}
+
+par(mfrow = c(2, 1), mar = c(4, 4, 2.5, 1))
+ts.plot(e_n_nr,main = "Residuals for Gaussian series, non robust", col = "blue",ylab="")
+ts.plot(e_n_rb,main = "Residuals for Gaussian series, robust",col = "red",ylab="")
+
+```
+
+```{r residuals for non gaussian series,fig.cap="Residuals for non-Gaussian series"}
+
+par(mfrow = c(2, 1), mar = c(4, 4, 2.5, 1))
+ts.plot(e_nn_nr,main = "Residuals for non-Gaussian series, non robust", col = "blue",ylab="")
+ts.plot(e_nn_rb,main = "Residuals for non-Gaussian series, robust",col = "red",ylab="")
+
+```
+
+
+These residual plots visually confirm the limitations of our manual model and justify the transition to the `GAS` package.
+
+* Gaussian Series (Top panels): Both robust and non-robust residuals are virtually identical and stable, indicating that a constant variance assumption is perfectly adequate here.
+
+* Non-Gaussian Series (Bottom panels): A large spike around observation 40 strongly affects the non-robust model. The Gaussian specification inflates the constant variance estimate to accommodate this extreme observation, compressing the remaining residuals. The robust Student-\(t\) model handles this spike more effectively, but the residual pattern still suggests time-varying volatility.
+
+------------------------------------------------------------------------
+
+# The GAS Model Framework
+
+## General Formulation
+
+Let $y_t$ be an observation from a parametric conditional distribution $p(y_t \mid \mathcal{F}_{t-1}; \theta_t)$, where $\mathcal{F}_{t-1}$ is the information set at time $t-1$ and $\theta_t \in \Theta$ is a vector of time-varying parameters. The GAS model updates $\theta_t$ according to:
+
+$$
+\theta_{t+1} = \omega + A \, s_t + B \, \theta_t
+$$
+
+where $\omega$ is an intercept vector, $A$ and $B$ are coefficient matrices, and $s_t$ is the scaled score of the log-likelihood:
+
+$$
+s_t = \mathcal{I}_{t|t-1}^{-d} \, \nabla_t, \qquad
+\nabla_t = \frac{\partial \log p(y_t \mid \mathcal{F}_{t-1}; \theta_t)}{\partial \theta_t}
+$$
+
+Here $\mathcal{I}_{t|t-1}$ is the conditional Fisher information and $d$ controls the scaling type. In this report we use Identity scaling ($d = 0$), so $s_t = \nabla_t$.
+
+### Link with the manual notation
+
+The manual score-driven mean model used in Section 4 is written as
+\[
+\mu_{t+1}
+=
+\alpha + \beta(\mu_t-\alpha) + \gamma u_t .
+\]
+
+This can be rearranged as
+\[
+\mu_{t+1}
+=
+\alpha(1-\beta) + \gamma u_t + \beta \mu_t .
+\]
+
+Therefore, it has the same structure as the univariate GAS recursion used by the `GAS` package for the location parameter:
+\[
+\mu_{t+1}
+=
+\kappa_1 + a_1 u_t + b_1 \mu_t.\]
+
+The correspondence between the manual notation and the package notation is
+\[\kappa_1 = \alpha(1-\beta),\qquad
+a_1 = \gamma,
+\qquad
+b_1 = \beta.\]
+
+Hence, \(\kappa_1\) is the intercept of the location recursion, \(a_1\) is the score coefficient, and \(b_1\) is the persistence parameter. When the scale is also modelled as time-varying, the `GAS` package estimates a second dynamic equation for the scale component, with parameters \(\kappa_2\), \(a_2\), and \(b_2\).
+
+A sufficient condition for the stationarity of the GAS recursion in the univariate case is $|B| < 1$, which ensures that the time-varying parameter $\theta_t$ does not diverge over time. In the manual score-driven mean model, the estimated persistence parameter satisfies $\hat{\beta} \approx 0.89$ for Subject 18 and $\hat{\beta} \approx 0.77$ for Subject 19, both strictly inside the unit circle. The GAS package estimates similarly yield $\hat{b}_1 < 1$ for both series (Table 7), confirming that all estimated models are consistent with covariance stationarity.
+
+The key property of the GAS framework is that the score $\nabla_t$ is the steepest ascent direction of the log-likelihood: parameter updates are always distribution-consistent. For heavy-tailed distributions such as the Student-$t$, the score automatically down-weights outlying observations, yielding more robust filtered trajectories compared to Gaussian-based updates.
+
+## GAS-Normal Specification
+
+The first model assumes a Gaussian conditional distribution:
+
+$$
+y_t \mid \mathcal{F}_{t-1} \sim \mathcal{N}(\mu_t,\, \sigma_t^2)
+$$
+
+Both the location $\mu_t$ and scale $\sigma_t$ are time-varying and updated via the GAS recursion.
+
+## GAS-Student-$t$ Specification
+
+The second model replaces the Gaussian with a Student-$t$ conditional distribution:
+
+$$
+y_t \mid \mathcal{F}_{t-1} \sim t\!\left(\mu_t,\, \sigma_t^2,\, \nu\right)
+$$
+
+where $\nu > 2$ is the degrees-of-freedom parameter governing tail heaviness. Location and scale are time-varying; $\nu$ is treated as a fixed but estimated constant (i.e.\ it appears in the model as an additional MLE parameter, not as a GAS-updated quantity). The Student-$t$ score assigns lower weight to extreme observations than the Gaussian score, making this specification inherently robust to heavy-tailed departures.
+
+### Score vector for dynamic location and scale
+
+For the Student-\(t\) specification, the score vector contains one component for the location and one component for the scale. Let
+\[
+e_t = y_t - \mu_t
+\]
+denote the one-step-ahead prediction error. The score with respect to the location parameter is
+\[
+\nabla_t^{\mu}
+=
+\frac{(\nu+1)e_t}{\nu \phi_t^2 + e_t^2}.
+\]
+
+The second component is the score with respect to the scale parameter \(\phi_t^2\):
+\[
+\nabla_t^{\phi^2}
+=
+\frac{1}{2\phi_t^2}
+\left[
+\frac{(\nu+1)(y_t-\mu_t)^2}
+{\nu\phi_t^2 + (y_t-\mu_t)^2}
+-1
+\right].
+\]
+
+Therefore, when both location and scale are dynamic, the GAS update is driven by the two-dimensional score vector
+\[
+\nabla_t
+=
+\begin{pmatrix}
+\nabla_t^{\mu} \\
+\nabla_t^{\phi^2}
+\end{pmatrix}.
+\]
+
+This clarifies the difference between the manual model and the package-based specification. In the manual model, only the conditional mean \(\mu_t\) is updated, while the scale is treated as a fixed nuisance parameter. In the `GAS` package, instead, both \(\mu_t\) and the scale are updated through the full score vector.
+
+### Link function for the scale parameter
+
+Since the scale parameter must remain strictly positive, the `GAS` package estimates the scale dynamics on an unconstrained transformed scale. In particular, it uses the exponential link function
+\[
+\sigma_t = \exp(\tilde{\phi}_t),
+\]
+where \(\tilde{\phi}_t \in \mathbb{R}\) is the unrestricted latent scale parameter updated by the GAS recursion.
+
+This transformation guarantees
+\[
+\sigma_t > 0
+\]
+for every \(t\). Consequently, the coefficient \(\kappa_2\) reported by the package should be interpreted as the intercept of the transformed scale recursion, not directly as the intercept of \(\sigma_t\). This explains why scale-related quantities are interpreted after applying the exponential transformation.
+
+In this report, the degrees-of-freedom parameter $\nu$ is treated as a fixed but estimated
+constant, which is implemented by setting \texttt{shape = FALSE} in the
+\texttt{UniGASSpec()} function. This choice is deliberate: since the primary goal is to
+compare the distributional assumption (Gaussian vs.\ Student-$t$) rather than to model
+time-variation in tail heaviness, keeping $\nu$ constant reduces the number of estimated
+parameters and avoids over-parameterisation. As noted by Ardia, Boudt and Catania (2019),
+setting \texttt{shape = FALSE} constrains $a_\nu = b_\nu = 0$ during likelihood
+maximisation, so $\nu$ enters the model purely as a static MLE parameter. The GAS package
+internally applies the mapping $\nu = \exp(\tilde{\nu}) + 2$ to ensure $\nu > 2$ at all
+times, guaranteeing the existence of a finite conditional variance.
+
+## Software: the `GAS` Package
+
+All package-based models are estimated in R using the `GAS` package (Ardia, Boudt and Catania, 2019). Key functions used:
+
+-   `UniGASSpec()`: defines the model specification (distribution, scaling type, which parameters are time-varying).
+-   `UniGASFit()`: estimates the model by numerical maximisation of the log-likelihood.
+-   `getFilteredParameters()`: extracts the filtered one-step-ahead parameter trajectories $\{\hat{\theta}_t\}_{t=1}^T$.
+-   `residuals(..., standardize = TRUE)`: computes standardised residuals for diagnostic checking.
+
+------------------------------------------------------------------------
+
+# GAS Package Estimation and Model Comparison
+
+The residuals of the manual score-driven mean model show that the non-Gaussian series presents heteroskedasticity, so the next step is to model the time-varying variance with the GAS package. In the following section, we focus mainly on the non-Gaussian series, since the Gaussian series already appears approximately homoskedastic and Table 12 shows that allowing for a time-varying scale does not improve the fit: the log-likelihood remains virtually unchanged, while the AIC increases due to the additional parameters.
+
+## Interpretation of package coefficients
+
+The coefficients reported by the `GAS` package follow the package notation rather than the manual notation used in Section 4. In the location-scale specification, \((\kappa_1,a_1,b_1)\) refer to the dynamic location equation, while \((\kappa_2,a_2,b_2)\) refer to the dynamic scale equation.
+
+Therefore, \(\kappa_1\), \(a_1\), and \(b_1\) are directly comparable to the manual parameters \(\alpha(1-\beta)\), \(\gamma\), and \(\beta\), respectively:
+\[
+\kappa_1 = \alpha(1-\beta),
+\qquad
+a_1 = \gamma,
+\qquad
+b_1 = \beta .
+\]
+
+By contrast, \(\kappa_2\), \(a_2\), and \(b_2\) have no direct counterpart in the manual model, because the manual specification treats the scale as fixed. Their presence in the package output reflects the additional dynamic scale equation estimated by the full GAS model.
+
+## Non-Gaussian series: Estimated Coefficients
+```{r coef-table-stud}
+cf2 <- coef(fit2)
+cf4 <- coef(fit4)
+nm <- union(names(cf2), names(cf4))
+v3 <- setNames(rep(NA_real_, length(nm)), nm); v3[names(cf2)] <- round(cf2, 4)
+v4 <- setNames(rep(NA_real_, length(nm)), nm); v4[names(cf4)] <- round(cf4, 4)
+coef_df2 <- data.frame(
+  `GAS-normal model`      = v3,
+  `GAS-Student-t model`  = v4,
+  check.names = FALSE,
+  row.names   = nm
+)
+knitr::kable(coef_df2,
+             caption = "Estimated parameters of the non gaussian series for both models. k3 is trhe estimated log-degrees-of-freedom parameter",
+             booktabs = TRUE, align = "lcc")
+```
+
+The estimated parameters reveal important differences between the two models applied to the non-Gaussian series. The intercept parameters $\kappa_1$ and $\kappa_2$ are close to zero for both models ($0.0484$ and $0.2539$ for the GAS-normal, $0.0267$ and $0.2317$ for the GAS-Student-$t$), consistent with BOLD signals centred around a stable baseline. The persistence parameters $b_1$ and $b_2$ are below unity for both models ($0.8008$ and $0.6297$ under GAS-normal, $0.8292$ and $0.6101$ under GAS-Student-$t$), confirming covariance stationarity of the recursion.
+
+The most informative parameter is $\kappa_3$, which represents the intercept of the degrees-of-freedom process and is only identified under the GAS-Student-$t$ model (it is not applicable under the GAS-normal, where $\kappa_3 = \texttt{NA}$). Following the reparameterisation of Ardia, Boudt and Catania (2019), the GAS package maps $\kappa_3$ to the degrees of freedom via the exponential link function with a shift of $c = 2$, which guarantees $\nu > 2$ and thus ensures the existence of a finite conditional variance:
+
+$$\hat{\nu} = \exp(\kappa_3) + 2$$
+
+For the non-Gaussian series, $\hat{\kappa}_3 = -0.1864$ implies
+
+$$\hat{\nu} = e^{-0.1864} + 2 \approx 2.83,$$
+
+which satisfies the theoretical requirement $\nu > 2$ and confirms the presence of extremely heavy tails. This estimate is fully consistent with the manual model estimate of $\hat{\nu} \approx 3.52$, and both jointly indicate that the BOLD signal requires a conditional distribution with very few degrees of freedom to adequately capture its tail behaviour.
+
+## Filtered Parameter Paths
+
+The filtered paths $\hat{\mu}_t$ and $\hat{\sigma}_t$ are inspected to assess how the GAS-Normal and GAS-Student-$t$ models update location and scale over time. Particular attention is given to the reaction of the filtered scale to extreme observations, since excessive spikes may indicate sensitivity to outliers and distributional misspecification.
+
+### Non-Gaussian Series (Subject 19)
+
+```{r filtered-nongaussian, fig.width=15,fig.height=2.5,fig.cap="Filtered $\\mu_t$ for the non-Gaussian series (Subject 19). Left column: GAS-Normal. Right column: GAS-Student-t ", fig.height=6}
+par(mfrow = c(1, 2), mar = c(4, 4, 2 , 1),cex=0.9)
+plot(par2[, "location"], type = "l", col = "blue", lwd = 1.8,
+     main = expression(mu[t] * " — GAS-Normal"),
+     ylab = expression(mu[t]), xlab = "Time")
+plot(par4[, "location"], type = "l", col = "red", lwd = 1.8,
+     main = expression(mu[t] * " — GAS-Student-t"),
+     ylab = expression(mu[t]), xlab = "Time")
+```
+
+There are no substantial differences between the two models with respect to $\mu_t$.
+
+```{r filtered-nongaussian1 ,fig.width=15,fig.height=2.5, fig.cap="Filtered $\\sigma_t$ for the non-Gaussian series (Subject 19). Left column: GAS-Normal. Right column: GAS-Student-t", fig.height=6}
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+plot(par2[, "scale"], type = "l", col = "blue", lwd = 1.8,
+     main = expression(sigma[t] * " — GAS-Normal"),
+     ylab = expression(sigma[t]), xlab = "Time")
+plot(par4[, "scale"], type = "l", col = "red", lwd = 1.8,
+     main = expression(sigma[t] * " — GAS-Student-t"),
+     ylab = expression(sigma[t]), xlab = "Time")
+par(mfrow = c(1, 1))
+```
+
+The filtered scale paths show a clear difference in robustness between the two specifications. Under the GAS-Normal model, $\hat{\sigma}_t$ reacts extremely strongly to the largest outlier, producing a spike close to 1500; this suggests that the Gaussian score interprets the extreme observation as a massive volatility shock. In contrast, the GAS-Student-$t$ scale remains much more controlled, with peaks of a far smaller magnitude, because the Student-$t$ score downweights extreme observations. This makes the filtered volatility path smoother and more interpretable for the non-Gaussian series.
+
+## Residual Diagnostics
+
+Standardised residuals $\hat{\varepsilon}_t = (y_t - \hat{\mu}_t)/\hat{\sigma}_t$ are examined for remaining serial correlation, excess kurtosis, and departures from the assumed distribution.
+
+### Non-normal series Residuals
+
+```{r res-student-ts,fig.height=3,fig.cap="Standardised residuals for the non-normal series."}
+par(mfrow = c(2, 1), mar = c(2, 4, 2, 1.5))
+ts.plot(res2, main = "Residuals — GAS normal",
+        ylab = "Std. residuals", col = "blue", lwd = 1.3)
+abline(h = 0, col = "black", lty = 2)
+ts.plot(res4, main = "Residuals — GAS-Student-t",
+        ylab = "Std. residuals", col = "red", lwd = 1.3)
+abline(h = 0, col = "black", lty = 2)
+par(mfrow = c(1, 1))
+```
+
+The standardised residuals of the GAS-Normal and GAS-Student-t models are visually almost
+indistinguishable: both oscillate within the $[-4, +4]$ range, appear centred around zero,
+and display no systematic autocorrelation patterns. The standardised residuals of the GAS-Normal and GAS-Student-\(t\) models are visually similar because scaling by the time-varying \(\hat{\sigma}_t\) makes them comparable across distributions. The advantage of the Student-\(t\) specification emerges instead from the higher log-likelihood, lower information criteria, and especially the smoother filtered scale path.
+
+```{r ljungbox-table2}
+lb_tests <- list(
+  `GAS-Normal, residuals`      = Box.test(res2,    lag = 20, type = "Ljung-Box"),
+  `GAS-Normal, residuals^2`    = Box.test(res2^2,  lag = 20, type = "Ljung-Box"),
+  `GAS-Student-t, residuals`   = Box.test(res4,   lag = 20, type = "Ljung-Box"),
+  `GAS-Student-t, residuals^2` = Box.test(res4^2, lag = 20, type = "Ljung-Box")
+)
+
+lb_df <- data.frame(
+  Series    = names(lb_tests),
+  `Q(20)`   = round(sapply(lb_tests, function(x) x$statistic), 3),
+  `p-value` = round(sapply(lb_tests, function(x) x$p.value),   4),
+  check.names = FALSE, row.names = NULL
+)
+knitr::kable(lb_df,
+             caption = "Subject 19's Ljung-Box test(20 lags) on residuals and squared residuals from the GAS model involving mean and variance. H0: no serial correlation.",
+             booktabs = TRUE, align = "lcc")
+```
+
+The Ljung--Box diagnostics for Subject 19 show that both GAS specifications remove serial dependence from the standardised residuals, with $p$-values well above 0.05. The same result holds for the squared residuals, indicating that once both mean and variance are updated through the GAS recursion, there is no evidence of remaining autocorrelation in the conditional variance.
+
+Although both models pass the Ljung--Box tests, this diagnostic only checks serial correlation and not the adequacy of the conditional distribution. The absence of residual autocorrelation should be interpreted together with the information criteria.
+
+## Information Criteria
+
+Models are compared using the AIC and the BIC:
+
+$$
+\text{AIC} = -2\hat{\ell} + 2k, \qquad \text{BIC} = -2\hat{\ell} + k\ln(n)
+$$
+
+where $\hat{\ell}$ is the maximised log-likelihood, $k$ the number of estimated parameters, and $n$ the sample size. Lower values indicate better fit penalised for complexity.
+
+### Non-Gaussian Series (Subject 19)
+
+```{r ic-ng}
+results_ng <- data.frame(
+  Model  = c("GAS-Normal", "GAS-Student-t (fixed shape)"),
+  LogLik = round(c(l2, l4), 3),
+  k      = c(k2, k4),
+  AIC    = round(c(-2*l2 + 2*k2, -2*l4 + 2*k4), 2),
+  BIC    = round(c(-2*l2 + log(n)*k2,
+                   -2*l4 + log(n)*k4), 2),
+  check.names = FALSE
+)
+knitr::kable(results_ng,
+             caption = "Information criteria for the non-Gaussian series (Subject 19).",
+             booktabs = TRUE, align = "lcccc")
+```
+
+### Gaussian Series (Subject 18)
+
+```{r ic-g}
+results_g <- data.frame(
+  Model  = c("GAS-Normal", "GAS-Student-t (fixed shape)"),
+  LogLik = round(c(l1, l3), 3),
+  k      = c(k1, k3),
+  AIC    = round(c(-2*l1 + 2*k1, -2*l3 + 2*k3), 2),
+  BIC    = round(c(-2*l1 + log(n_g)*k1, -2*l3 + log(n_g)*k3), 2),
+  check.names = FALSE
+)
+knitr::kable(results_g,
+             caption = "Information criteria for the Gaussian series (Subject 18).",
+             booktabs = TRUE, align = "lcccc")
+```
+
+For the Gaussian series, we estimated both the GAS-Normal and GAS-Student-$t$ models. We then computed the AIC and BIC to compare these specifications against each other, as well as against our manual score-driven mean model. The information criteria reveal that the manual mean model provides the best overall fit. Consequently, we will solely report the results for this optimal manual specification.
+
+## Overlaid Filtered Parameters
+
+```{r overlay-ng, fig.cap="Filtered location (left) and scale (right) for the non-Gaussian series: GAS-Normal (blue) vs GAS-Student-t with time-varying scale (red dashed). The Student-t scale is substantially smoother."}
+par(mfrow = c(1, 2),
+    mar = c(4, 4, 4, 1.5))
+plot(par2[, "location"], type = "l", col = "blue", lwd = 2,
+     ylim = range(c(par2[, "location"], par4[, "location"])),
+     main = expression("Filtered " * mu[t] * " — Non-Gaussian"),
+     ylab = expression(mu[t]), xlab = "Time")
+lines(par4[, "location"], col = "red", lwd = 2, lty = 2)
+legend("topright", legend = c("GAS-Normal", "GAS-Student-t"),
+       col = c("blue", "red"), lty = c(1, 2), lwd = 2, cex = 0.5)
+
+plot(par2[, "scale"], type = "l", col = "blue", lwd = 2,
+     ylim = range(c(par2[, "scale"], par4[, "scale"])),
+     main = expression("Filtered " * sigma[t] * " — Non-Gaussian"),
+     ylab = expression(sigma[t]), xlab = "Time")
+lines(par4[, "scale"], col = "red", lwd = 2, lty = 2)
+legend("topright", legend = c("GAS-Normal", "GAS-Student-t"),
+       col = c("blue", "red"), lty = c(1, 2), lwd = 2, cex = 0.5)
+```
+As expected, the filtered mean ($\mu_t$) trajectories are almost identical across both model specifications. However, there is a substantial difference in how the conditional scale ($\sigma_t$) is estimated. The robust Student-\(t\) model successfully reduces the impact of extreme shocks, maintaining a relatively stable volatility path. In contrast, it is the non-robust Gaussian model that reacts explosively to these outliers, producing massive, artificial spikes in the estimated variance.
+
+
+# Comparison between Manual Models and GAS Package Models
+
+The table below compares the manual score-driven mean model against the full GAS package model within each series, to isolate the effect of adding a time-varying scale. 
+The key theoretical difference between the two approaches lies in the dimensionality of the score vector used for updating. In the manual model, only the location $\mu_t$ is treated as time-varying; the scale $\sigma^2$ is held fixed and estimated as a static nuisance parameter. This is equivalent to computing only the first component of the full score vector $\nabla_t = (\partial \ell / \partial \mu_t, \; \partial \ell / \partial \sigma_t)^\top$ and setting the second component to zero. The GAS package instead updates both $\mu_t$ and $\sigma_t$ simultaneously via the complete score vector, allowing the model to adapt to genuine time-varying volatility. When the data are heteroscedastic, as for Subject 19, ignoring the scale component of the score leaves systematic variance dynamics unmodelled, which explains the residual improvement observed when moving from the manual to the package specification.
+
+```{r comparison-table}
+results_comp <- data.frame(
+  Series = c("Gaussian (S18)", "Gaussian (S18)",
+             "Non-Gaussian (S19)", "Non-Gaussian (S19)"),
+  Model  = c("Manual GAS-Normal (fixed scale)",
+             "Package GAS-Normal (tv scale)",
+             "Manual GAS-Student-t (fixed scale)",
+             "Package GAS-Student-t (fixed scale, tv scale)"),
+  LogLik = round(c(ft_n_nr$lL, l1, ft_nn_rb$lL, l4), 3),
+  k      = c(length(th_n_nr), k1, length(th_nn_rb), k4),
+  AIC    = round(c(-2 * ft_n_nr$lL + 2 * length(th_n_nr),
+                   -2 * l1 + 2 * k1,
+                   -2 * ft_nn_rb$lL + 2 * length(th_nn_rb),
+                   -2 * l4 + 2 * k4), 2),
+  check.names = FALSE
+)
+knitr::kable(results_comp,
+             caption = "Comparison of manual vs package models within each series. The manual model treats the scale as a fixed nuisance parameter; the package model allows it to be time-varying.",
+             booktabs = TRUE,
+             align = "llccc")
+```
+
+For the Gaussian series, the manual and package GAS-Normal models achieve virtually identical log-likelihoods; the package model has a slightly higher AIC because it estimates two additional scale dynamics parameters ($a_2$, $b_2$). For the non-Gaussian series, the package GAS-Student-$t$ improves on the manual variant because allowing a time-varying scale absorbs some of the variance dynamics that the constant-scale manual model leaves in the residuals.
+
+# Discussion and Conclusions
+
+This report has applied GAS models to resting-state fMRI BOLD time series from ROI 69,
+selecting two subjects with a sharp distributional contrast: Subject 18, well-described by
+a Gaussian distribution, and Subject 19, exhibiting pronounced heavy tails and left skewness.
+A manual score-driven mean model was first implemented to illustrate the robustness mechanism
+of the GAS framework; the analysis was then extended to the GAS package, allowing both
+location and scale to evolve over time.
+
+## Gaussian Series — ROI 69, Subject 18
+
+Subject 18 passes both the Shapiro--Wilk ($p = 0.9933$) and Jarque--Bera ($p = 0.9789$)
+normality tests, and this Gaussianity is reflected consistently throughout the modelling
+pipeline. The manual robust and non-robust specifications yield virtually identical results
+(AIC $1051.6$ vs.\ $1053.6$), with estimated degrees of freedom $\hat{\nu} \approx 185$
+confirming that the Student-$t$ score collapses to the Gaussian score. The Ljung-Box test
+passes comfortably for both residuals and squared residuals.
+
+The GAS package confirms this picture: GAS-Normal achieves $\text{AIC} = 1055.58$,
+$\text{BIC} = 1079.59$, while GAS-Student-$t$ performs marginally worse
+($\text{AIC} = 1057.69$, $\text{BIC} = 1085.70$). The conclusion is clear: the GAS-Normal
+specification is both necessary and sufficient for this series.
+
+## Non-Gaussian Series — ROI 69, Subject 19
+
+The GAS-Normal fails visibly on Subject 19: the filtered scale $\hat{\sigma}_t$ spikes
+to values exceeding $1500$ in response to a single extreme observation near $-30$, an
+artefact of the unbounded Gaussian score, with information criteria confirming the
+misspecification quantitatively ($\text{AIC} = 1432.31$, $\text{BIC} = 1456.32$).
+Switching to the Student-$t$ specification resolves the misspecification across every
+diagnostic dimension. The manual robust model estimates $\hat{\nu} \approx 3.52$,
+confirming strongly heavy-tailed behaviour with AIC
+dropping from $1802.6$ to $1473.8$. This is corroborated by the GAS package estimate:
+following the reparameterisation of Ardia, Boudt and Catania (2019), $\hat{\kappa}_3 =
+-0.1864$ implies $\hat{\nu} = e^{-0.1864} + 2 \approx 2.83$, consistent with the manual
+estimate and jointly confirming that the BOLD signal of Subject 19 demands an extremely
+heavy-tailed conditional distribution. The improvement is further reflected in the
+information criteria, with AIC dropping from $1432.31$ to $1423.27$ and BIC from $1456.32$
+to $1451.28$, favouring the Student-$t$ specification even after penalising for the
+additional parameter. Finally, the Ljung-Box test on squared residuals passes comfortably
+($p \approx 0.97$), confirming the absence of residual ARCH effects.
+
+------------------------------------------------------------------------
+
+# References
+
+Ardia, D., Boudt, K., & Catania, L. (2019). Generalized autoregressive
+score models in R: The GAS package. *Journal of Statistical Software*,
+88(6), 1--28.
+
+Creal, D., Koopman, S.J., & Lucas, A. (2013). Generalized autoregressive
+score models with applications. *Journal of Applied Econometrics*,
+28(5), 777--795.
+
+Harvey, A.C. (2013). *Dynamic Models for Volatility and Heavy Tails*.
+Cambridge University Press.
+
+Ljung, G.M., & Box, G.E.P. (1978). On a measure of lack of fit in time
+series models. *Biometrika*, 65(2), 297--303.
+
+Engle, R.F. (1982). Autoregressive conditional heteroscedasticity with
+estimates of the variance of United Kingdom inflation. *Econometrica*,
+50(4), 987--1007.
+
+Shapiro, S.S., & Wilk, M.B. (1965). An analysis of variance test for
+normality. *Biometrika*, 52(3--4), 591--611.
+
+Jarque, C.M., & Bera, A.K. (1987). A test for normality of observations
+and regression residuals. *International Statistical Review*, 55(2),
+163--172.
+
+------------------------------------------------------------------------
+
